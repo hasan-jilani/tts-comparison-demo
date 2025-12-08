@@ -29,148 +29,170 @@ function generateConnectionId() {
  * @param {string} connectionId - Unique connection identifier
  * @returns {Promise<void>}
  */
-async function streamElevenLabsTTS(text, connectionId, voiceId = null) {
+async function streamElevenLabsTTS(text, connectionId, voiceId = null, modelId = null, applyTextNormalization = null) {
   const ws = activeConnections.get(connectionId);
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
   try {
-    // Use provided voice ID or fallback to default (Dexter)
-    const selectedVoiceId = voiceId || 'Smxkoz0xiOoHo5WcSskf';
+    // Use provided voice ID or fallback to default (Sarah)
+    const selectedVoiceId = voiceId || 'EXAVITQu4vr4xnSDxMaL';
+    // Use provided model ID or fallback to default (Flash v2.5)
+    const selectedModelId = modelId || 'eleven_flash_v2_5';
     
     const apiKey = process.env.ELEVENLABS_API_KEY;
-    
-    console.log('\n========== ELEVENLABS API REQUEST ==========');
-    console.log('URL:', `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}/stream`);
-    console.log('Voice ID:', selectedVoiceId);
-    console.log('Model:', 'eleven_flash_v2_5');
-    console.log('Text Length:', text.length, 'characters');
-    console.log('API Key (FULL):', apiKey || 'NOT SET');
-    console.log('API Key Length:', apiKey ? apiKey.length : 0);
-    console.log('Headers:');
-    console.log('  - Accept: audio/mpeg');
-    console.log('  - Content-Type: application/json');
-    console.log('  - xi-api-key:', apiKey || 'NOT SET');
-    console.log('==========================================\n');
-    
-    const response = await axios({
-      method: 'POST',
-      url: `https://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}/stream`,
-      headers: {
-        'Accept': 'audio/mpeg',
-        'Content-Type': 'application/json',
-        'xi-api-key': apiKey
-      },
-      data: {
-        text: text,
-        model_id: 'eleven_flash_v2_5',
-        voice_settings: {
-          speed: 0.8,
-          stability: 0.75,
-          similarity_boost: 0.75
-        }
-      },
-      responseType: 'stream',
-      validateStatus: () => true // Don't throw on any status, handle manually
-    });
-    
-    // Check if response is an error
-    if (response.status < 200 || response.status >= 300) {
-      // Collect error response body
-      const chunks = [];
-      response.data.on('data', (chunk) => chunks.push(chunk));
-      response.data.on('end', () => {
-        const errorBody = Buffer.concat(chunks).toString();
-        console.error('ElevenLabs error response:', errorBody);
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({
-            provider: 'elevenlabs',
-            type: 'error',
-            message: `HTTP ${response.status}: ${errorBody || response.statusText}`
-          }));
-        }
-      });
-      return;
+    if (!apiKey) {
+      throw new Error('ELEVENLABS_API_KEY is not set');
     }
-
-    // Stream audio chunks immediately to client
-    response.data.on('data', (chunk) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({
-          provider: 'elevenlabs',
-          type: 'audio',
-          data: chunk.toString('base64')
-        }));
+    
+    // Track audio bytes
+    let totalAudioBytes = 0;
+    let elevenlabsAudioReceived = false;
+    let elevenlabsTimeout = null;
+    
+    // Helper function to send completion
+    let sentCompletion = false;
+    const sendElevenLabsCompletion = () => {
+      if (elevenlabsTimeout) {
+        clearTimeout(elevenlabsTimeout);
+        elevenlabsTimeout = null;
       }
-    });
-
-    response.data.on('end', () => {
-      if (ws.readyState === WebSocket.OPEN) {
+      
+      if (sentCompletion) return;
+      sentCompletion = true;
+      
+      if (ws.readyState === WebSocket.OPEN && totalAudioBytes > 0) {
         ws.send(JSON.stringify({
           provider: 'elevenlabs',
           type: 'done'
         }));
       }
+    };
+    
+    // Build WebSocket URL with query parameters
+    const queryParams = new URLSearchParams({
+      model_id: selectedModelId,
+      output_format: 'pcm_22050'
+    });
+    
+    if (applyTextNormalization) {
+      queryParams.append('apply_text_normalization', applyTextNormalization);
+    }
+    
+    const wsUrl = `wss://api.elevenlabs.io/v1/text-to-speech/${selectedVoiceId}/stream-input?${queryParams.toString()}`;
+    
+    console.log('\n========== ELEVENLABS API REQUEST ==========');
+    console.log('WebSocket URL:', wsUrl);
+    console.log('Voice ID:', selectedVoiceId);
+    console.log('Model:', selectedModelId);
+    console.log('Output Format: pcm_22050');
+    console.log('Text Length:', text.length, 'characters');
+    if (applyTextNormalization) {
+      console.log('Apply Text Normalization:', applyTextNormalization);
+    }
+    console.log('==========================================\n');
+    
+    const elevenlabsWs = new WebSocket(wsUrl, {
+      headers: {
+        'xi-api-key': apiKey
+      }
     });
 
-    response.data.on('error', (error) => {
-      console.error('ElevenLabs stream error:', error);
+    elevenlabsWs.on('open', () => {
+      console.log('ElevenLabs WebSocket connected');
+      
+      // Step 1: Initialize connection with space
+      const initMessage = {
+        text: ' ',
+        voice_settings: {
+          speed: 0.8,
+          stability: 0.75,
+          similarity_boost: 0.75
+        },
+        'xi-api-key': apiKey
+      };
+      
+      elevenlabsWs.send(JSON.stringify(initMessage));
+      
+      // Step 2: Send the actual text
+      const textMessage = {
+        text: text,
+        try_trigger_generation: true
+      };
+      
+      elevenlabsWs.send(JSON.stringify(textMessage));
+      
+      // Step 3: Close connection
+      const closeMessage = {
+        text: ''
+      };
+      
+      elevenlabsWs.send(JSON.stringify(closeMessage));
+    });
+
+    elevenlabsWs.on('message', (data) => {
+      if (ws.readyState === WebSocket.OPEN) {
+        try {
+          // ElevenLabs sends JSON messages
+          const message = JSON.parse(data.toString());
+          
+          // Check if it's an AudioOutput message
+          if (message.audio) {
+            // Decode base64 audio data
+            const audioBuffer = Buffer.from(message.audio, 'base64');
+            const dataLength = audioBuffer.length;
+            
+            elevenlabsAudioReceived = true;
+            totalAudioBytes += dataLength;
+            
+            // Clear timeout
+            if (elevenlabsTimeout) {
+              clearTimeout(elevenlabsTimeout);
+            }
+            
+            // Send PCM chunk to client
+            ws.send(JSON.stringify({
+              provider: 'elevenlabs',
+              type: 'audio',
+              data: audioBuffer.toString('base64')
+            }));
+            
+            // Set timeout to detect end of stream
+            elevenlabsTimeout = setTimeout(() => {
+              sendElevenLabsCompletion();
+            }, 1000);
+          } else if (message.isFinal === true) {
+            // FinalOutput message received
+            console.log('ElevenLabs stream complete, total bytes:', totalAudioBytes);
+            sendElevenLabsCompletion();
+          }
+        } catch (parseError) {
+          console.error('Error parsing ElevenLabs message:', parseError);
+        }
+      }
+    });
+
+    elevenlabsWs.on('error', (error) => {
+      console.error('ElevenLabs WebSocket error:', error);
       if (ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
           provider: 'elevenlabs',
           type: 'error',
-          message: error.message
+          message: error.message || 'WebSocket error'
         }));
       }
     });
+
+    elevenlabsWs.on('close', () => {
+      console.log('ElevenLabs WebSocket closed');
+      sendElevenLabsCompletion();
+    });
   } catch (error) {
     console.error('ElevenLabs streaming error:', error);
-    
-    // Log detailed error response for debugging
-    if (error.response) {
-      console.error('ElevenLabs error response status:', error.response.status);
-      console.error('ElevenLabs error response headers:', error.response.headers);
-      if (error.response.data) {
-        // Try to read the error response body
-        const chunks = [];
-        error.response.data.on('data', (chunk) => chunks.push(chunk));
-        error.response.data.on('end', () => {
-          const errorBody = Buffer.concat(chunks).toString();
-          console.error('ElevenLabs error response body:', errorBody);
-        });
-      }
-    }
-    
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      let errorMessage = 'Unknown error';
-      if (error.response) {
-        // HTTP error response (401, 404, etc.)
-        errorMessage = `HTTP ${error.response.status}: ${error.response.statusText}`;
-        if (error.response.data) {
-          try {
-            // For stream responses, we need to collect chunks
-            const chunks = [];
-            error.response.data.on('data', (chunk) => chunks.push(chunk));
-            error.response.data.on('end', () => {
-              try {
-                const errorBody = Buffer.concat(chunks).toString();
-                const errorData = JSON.parse(errorBody);
-                errorMessage += ` - ${errorData.message || errorData.detail || errorBody}`;
-              } catch (e) {
-                errorMessage += ` - ${Buffer.concat(chunks).toString()}`;
-              }
-            });
-          } catch (e) {
-            errorMessage += ` - ${error.response.data}`;
-          }
-        }
-      } else if (error.message) {
-        errorMessage = error.message;
-      }
-      
+    if (ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({
         provider: 'elevenlabs',
         type: 'error',
-        message: errorMessage
+        message: error.message || 'Unknown error'
       }));
     }
   }
@@ -227,9 +249,11 @@ function createWavHeader(dataLength) {
  * Cartesia Sonic Streaming TTS via WebSocket with WAV header wrapping
  * @param {string} text - Plain text to synthesize
  * @param {string} connectionId - Unique connection identifier
+ * @param {string} voiceId - Voice ID (e.g., 'f786b574-daa5-4673-aa0c-cbe3e8534c02')
+ * @param {string} modelId - Model ID ('sonic-3' or 'sonic-2')
  * @returns {Promise<void>}
  */
-async function streamCartesiaTTS(text, connectionId, voiceId = null) {
+async function streamCartesiaTTS(text, connectionId, voiceId = null, modelId = null) {
   const ws = activeConnections.get(connectionId);
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -259,7 +283,6 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
       sentCompletion = true;
       
       if (ws.readyState === WebSocket.OPEN && totalAudioBytes > 0) {
-        console.log('Cartesia stream complete, total bytes:', totalAudioBytes);
         ws.send(JSON.stringify({
           provider: 'cartesia',
           type: 'done'
@@ -269,13 +292,7 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
     
     // Cartesia TTS WebSocket endpoint
     const wsUrl = 'wss://api.cartesia.ai/tts/websocket';
-    
-    console.log('Cartesia WebSocket connection:', {
-      url: wsUrl,
-      model: 'sonic-3',
-      textLength: text.length,
-      contextId: sanitizedContextId
-    });
+    const selectedModelId = modelId || 'sonic-turbo';
     
     const cartesiaWs = new WebSocket(wsUrl, {
       headers: {
@@ -288,7 +305,7 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
       // Send TTS request with raw PCM format
       try {
         const requestPayload = {
-          model_id: 'sonic-3',
+          model_id: selectedModelId,
           transcript: text,
           voice: {
             mode: 'id',
@@ -310,7 +327,6 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
         };
         
         const jsonString = JSON.stringify(requestPayload);
-        console.log('Sending Cartesia request:', jsonString);
         
         // Send request to Cartesia
         cartesiaWs.send(jsonString);
@@ -338,7 +354,6 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
         } else if (data instanceof ArrayBuffer) {
           messageStr = Buffer.from(data).toString('utf8');
         } else {
-          console.warn('Cartesia: Unexpected message type:', typeof data);
           return;
         }
         
@@ -349,21 +364,18 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
           // Handle different message types per API spec
           if (message.type === 'done' && message.done === true) {
             // Done Response: {"type": "done", "done": true, ...}
-            console.log('Cartesia stream complete via done message');
             sendCartesiaCompletion();
             return;
           }
           
           if (message.type === 'flush_done') {
             // Flush Done Response: {"type": "flush_done", "flush_done": true, ...}
-            console.log('Cartesia flush done received');
             // Continue waiting for more chunks or done message
             return;
           }
           
           if (message.type === 'timestamps') {
             // Word Timestamps Response: {"type": "timestamps", "word_timestamps": {...}, ...}
-            console.log('Cartesia timestamps received (ignoring for now)');
             return;
           }
           
@@ -395,38 +407,6 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
               if (audioBuffer.length > 0) {
                 cartesiaAudioReceived = true;
                 totalAudioBytes += audioBuffer.length;
-                console.log('Cartesia chunk: decoded audio size:', audioBuffer.length, 'bytes, total:', totalAudioBytes, 'bytes');
-                
-                // Validate first chunk - inspect decoded bytes
-                if (totalAudioBytes === audioBuffer.length) {
-                  // First chunk - validate format
-                  const firstBytes = audioBuffer.slice(0, Math.min(64, audioBuffer.length));
-                  const hexPreview = Array.from(firstBytes.slice(0, 32)).map(b => '0x' + b.toString(16).padStart(2, '0')).join(' ');
-                  const asciiPreview = firstBytes.slice(0, 32).toString('ascii').replace(/[^\x20-\x7E]/g, '.');
-                  
-                  console.log('Cartesia first chunk validation:');
-                  console.log('  Hex (first 32 bytes):', hexPreview);
-                  console.log('  ASCII (first 32 bytes):', asciiPreview);
-                  
-                  // Check for container formats
-                  const first4Bytes = firstBytes.toString('ascii', 0, 4);
-                  if (first4Bytes === 'RIFF') {
-                    console.warn('  ⚠️  Detected WAV container (RIFF header) - not raw PCM!');
-                  } else if (firstBytes.toString('ascii', 0, 3) === 'ID3') {
-                    console.warn('  ⚠️  Detected MP3 container (ID3 header) - not raw PCM!');
-                  } else {
-                    console.log('  ✓ Appears to be raw PCM (no container header)');
-                    // For float32 PCM, check if first sample is reasonable
-                    if (audioBuffer.length >= 4) {
-                      const dv = new DataView(audioBuffer.buffer, audioBuffer.byteOffset, 4);
-                      const firstSample = dv.getFloat32(0, true);
-                      console.log('  First float32 sample:', firstSample, '(should be between -1.0 and 1.0)');
-                      if (Math.abs(firstSample) > 10) {
-                        console.warn('  ⚠️  First sample is out of normal range - may indicate format mismatch');
-                      }
-                    }
-                  }
-                }
                 
                 // Clear timeout
                 if (cartesiaTimeout) {
@@ -442,11 +422,8 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
                 
                 // Set timeout to detect end of stream
                 cartesiaTimeout = setTimeout(() => {
-                  console.log('Cartesia stream timeout - no more data for 1s, assuming complete');
                   sendCartesiaCompletion();
                 }, 1000);
-              } else {
-                console.warn('Cartesia chunk: decoded audio buffer is empty');
               }
             } catch (audioError) {
               console.error('Cartesia: Error decoding audio from chunk:', audioError);
@@ -455,10 +432,7 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
             return;
           }
           
-          // Unknown message type - log for debugging
-          console.log('Cartesia unknown message type:', message.type || 'none');
-          console.log('Message keys:', Object.keys(message));
-          console.log('Full message:', JSON.stringify(message, null, 2).substring(0, 300));
+          // Unknown message type - ignore
           
         } catch (e) {
           // Not valid JSON - this shouldn't happen per API spec
@@ -466,7 +440,6 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
           console.error('Message preview:', messageStr.substring(0, 200));
         }
       } else {
-        console.warn('Cartesia message received but client WebSocket not open, readyState:', ws.readyState);
       }
     });
 
@@ -482,9 +455,6 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
     });
 
     cartesiaWs.on('close', (code, reason) => {
-      console.log('Cartesia WebSocket closed, code:', code, 'reason:', reason?.toString());
-      console.log('Total audio bytes received:', totalAudioBytes);
-      
       // Clear timeout if still active
       if (cartesiaTimeout) {
         clearTimeout(cartesiaTimeout);
@@ -514,9 +484,10 @@ async function streamCartesiaTTS(text, connectionId, voiceId = null) {
  * Deepgram Aura-2 Streaming TTS via WebSocket
  * @param {string} text - Plain text to synthesize
  * @param {string} connectionId - Unique connection identifier
+ * @param {string} voiceId - Voice ID (e.g., 'aura-2-thalia-en')
  * @returns {Promise<void>}
  */
-async function streamDeepgramTTS(text, connectionId, model = null) {
+async function streamDeepgramTTS(text, connectionId, voiceId = null) {
   const ws = activeConnections.get(connectionId);
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -544,7 +515,6 @@ async function streamDeepgramTTS(text, connectionId, model = null) {
       sentCompletion = true;
       
       if (ws.readyState === WebSocket.OPEN && totalAudioBytes > 0) {
-        console.log('Deepgram stream complete, total bytes:', totalAudioBytes);
         ws.send(JSON.stringify({
           provider: 'deepgram',
           type: 'done'
@@ -553,9 +523,10 @@ async function streamDeepgramTTS(text, connectionId, model = null) {
     };
     
     // Deepgram WebSocket endpoint with query parameters
-    const selectedModel = model || 'aura-2-thalia-en';
+    // Use voiceId directly as the model parameter (e.g., 'aura-2-thalia-en')
+    const selectedModel = voiceId || 'aura-2-thalia-en';
     const encoding = 'linear16'; // 16-bit PCM
-    const sampleRate = '24000';
+    const sampleRate = '24000'; // Aura-2 uses 24000 Hz
     const wsUrl = `wss://api.deepgram.com/v1/speak?model=${selectedModel}&encoding=${encoding}&sample_rate=${sampleRate}`;
     
     // Comprehensive API request logging
@@ -586,22 +557,18 @@ async function streamDeepgramTTS(text, connectionId, model = null) {
     const deepgramWs = new WebSocket(wsUrl, ['token', apiKey]);
     
     deepgramWs.on('open', () => {
-      console.log('Deepgram WebSocket opened');
-      
       // Send text message: {"type": "Speak", "text": "..."}
       const textMessage = {
         type: 'Speak',
         text: text
       };
       
-      console.log('Sending Deepgram text message:', JSON.stringify(textMessage, null, 2));
       deepgramWs.send(JSON.stringify(textMessage));
       
       // Send flush message to get final audio: {"type": "Flush"}
       const flushMessage = {
         type: 'Flush'
       };
-      console.log('Sending Deepgram flush message:', JSON.stringify(flushMessage, null, 2));
       deepgramWs.send(JSON.stringify(flushMessage));
     });
     
@@ -615,7 +582,6 @@ async function streamDeepgramTTS(text, connectionId, model = null) {
           
           deepgramAudioReceived = true;
           totalAudioBytes += dataLength;
-          console.log('Deepgram PCM chunk received (binary), size:', dataLength, 'bytes, total:', totalAudioBytes, 'bytes');
           
           // Clear timeout
           if (deepgramTimeout) {
@@ -629,74 +595,43 @@ async function streamDeepgramTTS(text, connectionId, model = null) {
             data: audioBuffer.toString('base64')
           }));
           
-          // Set timeout to detect end of stream
+          // Set short timeout to detect end of stream (reduced from 1000ms to 200ms)
+          // The 'Flushed' message should arrive first, but this is a fallback
+          if (deepgramTimeout) {
+            clearTimeout(deepgramTimeout);
+          }
           deepgramTimeout = setTimeout(() => {
-            console.log('Deepgram stream timeout - no more data for 1s, assuming complete');
             sendDeepgramCompletion();
-          }, 1000);
+          }, 200);
           
         } else if (typeof data === 'string') {
           // JSON metadata message
-          console.log('\n========== DEEPGRAM JSON MESSAGE RECEIVED ==========');
-          console.log('Raw message (first 500 chars):', data.substring(0, 500));
-          console.log('Message length:', data.length);
-          
           try {
             const message = JSON.parse(data);
-            console.log('Parsed message type:', message.type);
-            console.log('Full parsed message:', JSON.stringify(message, null, 2));
             
             // Handle different message types per spec
             if (message.type === 'Metadata') {
               deepgramRequestId = message.request_id;
-              console.log('\n========== DEEPGRAM METADATA RECEIVED ==========');
-              console.log('Request ID:', message.request_id);
-              console.log('Model Name:', message.model_name);
-              console.log('Model Version:', message.model_version);
-              console.log('Full metadata:', JSON.stringify(message, null, 2));
-              console.log('==========================================\n');
-              // Metadata - just log it, continue
+              console.log('Deepgram Request ID:', message.request_id);
+              // Metadata - just log request ID, continue
               
             } else if (message.type === 'Flushed') {
-              console.log('\n========== DEEPGRAM FLUSHED ==========');
-              console.log('Sequence ID:', message.sequence_id);
-              console.log('Full message:', JSON.stringify(message, null, 2));
-              console.log('==========================================\n');
-              // Flushed - stream is complete
+              // Flushed - stream is complete, send immediately (no timeout delay)
+              // Clear any pending timeout first
+              if (deepgramTimeout) {
+                clearTimeout(deepgramTimeout);
+                deepgramTimeout = null;
+              }
               sendDeepgramCompletion();
               
-            } else if (message.type === 'Cleared') {
-              console.log('\n========== DEEPGRAM CLEARED ==========');
-              console.log('Sequence ID:', message.sequence_id);
-              console.log('Full message:', JSON.stringify(message, null, 2));
-              console.log('==========================================\n');
-              // Cleared - buffer cleared, continue
-              
             } else if (message.type === 'Warning') {
-              console.warn('\n========== DEEPGRAM WARNING ==========');
-              console.warn('Description:', message.description);
-              console.warn('Code:', message.code);
-              console.warn('Full message:', JSON.stringify(message, null, 2));
-              console.warn('==========================================\n');
+              console.warn('Deepgram Warning:', message.description || message.code);
               // Warning - log but continue
-              
-            } else {
-              console.log('\n========== DEEPGRAM UNKNOWN MESSAGE TYPE ==========');
-              console.log('Type:', message.type);
-              console.log('Full message:', JSON.stringify(message, null, 2));
-              console.log('==========================================\n');
             }
           } catch (e) {
-            console.error('\n========== DEEPGRAM JSON PARSE ERROR ==========');
-            console.error('Error:', e.message);
-            console.error('Raw message (first 500 chars):', data.substring(0, 500));
-            console.error('Message length:', data.length);
-            console.error('==========================================\n');
+            console.error('Deepgram JSON parse error:', e.message);
           }
-          console.log('==========================================\n');
         }
-      } else {
-        console.warn('Deepgram message received but client WebSocket not open, readyState:', ws.readyState);
       }
     });
     
@@ -712,9 +647,6 @@ async function streamDeepgramTTS(text, connectionId, model = null) {
     });
     
     deepgramWs.on('close', (code, reason) => {
-      console.log('Deepgram WebSocket closed, code:', code, 'reason:', reason?.toString());
-      console.log('Total audio bytes received:', totalAudioBytes);
-      
       // Clear timeout if still active
       if (deepgramTimeout) {
         clearTimeout(deepgramTimeout);
@@ -745,7 +677,7 @@ async function streamDeepgramTTS(text, connectionId, model = null) {
  * @param {string} speaker - Speaker/voice ID (default: 'astra')
  * @returns {Promise<void>}
  */
-async function streamRimeTTS(text, connectionId, speaker = null) {
+async function streamRimeTTS(text, connectionId, speaker = null, modelId = null, noTextNormalization = true) {
   const ws = activeConnections.get(connectionId);
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -759,6 +691,7 @@ async function streamRimeTTS(text, connectionId, speaker = null) {
     console.log('Rime API Key loaded:', apiKey ? `✓ (${apiKey.substring(0, 8)}...)` : '✗');
     
     const selectedSpeaker = speaker || 'astra';
+    const selectedModelId = modelId || 'mistv2';
     
     // Track audio bytes
     let totalAudioBytes = 0;
@@ -779,23 +712,30 @@ async function streamRimeTTS(text, connectionId, speaker = null) {
       }
     };
     
-    // Rime WebSocket endpoint with query parameters (Mist v2 plaintext API)
+    // Rime WebSocket endpoint with query parameters
     // segment=immediate: start generating audio immediately instead of waiting for full sentences
     // audioFormat=pcm: request raw PCM audio bytes instead of MP3
-    const wsUrl = `wss://users.rime.ai/ws` +
+    // noTextNormalization: only for Mist v2, true = skip normalization (faster, but may mispronounce), false = normalize (slower, better pronunciation)
+    let wsUrl = `wss://users.rime.ai/ws` +
       `?speaker=${selectedSpeaker}` +
-      `&modelId=mistv2` +
+      `&modelId=${selectedModelId}` +
       `&audioFormat=pcm` +
       `&samplingRate=24000` +
       `&segment=immediate`;
     
+    // Only add noTextNormalization parameter for Mist v2 (Arcana doesn't support it)
+    if (selectedModelId === 'mistv2') {
+      wsUrl += `&noTextNormalization=${noTextNormalization}`;
+    }
+    
     console.log('Rime WebSocket connection:', {
       url: wsUrl,
       speaker: selectedSpeaker,
-      modelId: 'mistv2',
+      modelId: selectedModelId,
       audioFormat: 'pcm',
       samplingRate: 24000,
       segment: 'immediate',
+      noTextNormalization: selectedModelId === 'mistv2' ? noTextNormalization : 'N/A (Arcana)',
       textLength: text.length
     });
     
@@ -901,6 +841,8 @@ wss.on('connection', (ws) => {
       if (data.type === 'start' && data.text) {
         const text = data.text;
         const voices = data.voices || {};
+        const models = data.models || {};
+        const textNormalization = data.textNormalization || {};
         const enabledProviders = data.enabledProviders || {
           elevenlabs: true,
           deepgram: true,
@@ -911,17 +853,27 @@ wss.on('connection', (ws) => {
         // Build array of streaming promises for enabled providers only
         const streamingPromises = [];
         
-        // Always stream ElevenLabs and Deepgram
-        streamingPromises.push(streamElevenLabsTTS(text, connectionId, voices.elevenlabs));
-        streamingPromises.push(streamDeepgramTTS(text, connectionId, voices.deepgram));
+        // Conditionally stream all providers based on enabledProviders
+        if (enabledProviders.elevenlabs && voices.elevenlabs) {
+          streamingPromises.push(streamElevenLabsTTS(text, connectionId, voices.elevenlabs, models.elevenlabs, textNormalization.elevenlabs));
+        }
         
-        // Conditionally stream optional providers
+        if (enabledProviders.deepgram && voices.deepgram) {
+          streamingPromises.push(streamDeepgramTTS(text, connectionId, voices.deepgram));
+        }
+        
         if (enabledProviders.cartesia && voices.cartesia) {
-          streamingPromises.push(streamCartesiaTTS(text, connectionId, voices.cartesia));
+          streamingPromises.push(streamCartesiaTTS(text, connectionId, voices.cartesia, models.cartesia));
         }
         
         if (enabledProviders.rime && voices.rime) {
-          streamingPromises.push(streamRimeTTS(text, connectionId, voices.rime));
+          // Convert UI value ("on"/"off") to API boolean (only for Mist v2)
+          // UI "on" = normalization ON = noTextNormalization: false
+          // UI "off" = normalization OFF = noTextNormalization: true
+          const rimeModel = models.rime || 'mistv2';
+          const rimeTextNorm = (rimeModel === 'mistv2') ? (textNormalization.rime || 'off') : null;
+          const noTextNormalization = rimeTextNorm === 'off';
+          streamingPromises.push(streamRimeTTS(text, connectionId, voices.rime, rimeModel, noTextNormalization));
         }
         
         // Start streaming from enabled providers concurrently

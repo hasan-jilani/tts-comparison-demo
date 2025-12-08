@@ -100,19 +100,26 @@ const CHALLENGES = {
 let ws = null;
 let audioContext = null;
 let startTime = null;
+let providerStartTimes = {}; // Track when each provider starts buffering
+let providerBufferingTimes = {}; // Track buffering time for each provider
+let summaryPrinted = false; // Track if TTFPA summary has been printed
 let currentText = '';
 
 // Provider state tracking
 const providerState = {
     elevenlabs: {
         ttfa: null,
-        audioBuffer: null,
+        audioBuffer: null, // For download only (complete buffer)
         sourceNode: null,
         isStreaming: false,
         isBuffering: false,
-        isBuffered: false,
+        isBuffered: false, // True when we have enough audio to start playback
         firstChunkReceived: false,
-        audioChunks: [] // Accumulate raw audio chunks
+        audioChunks: [], // For download accumulator (all chunks)
+        playbackQueue: [], // Queue of AudioBuffers for streaming playback
+        playHeadTime: null, // Next scheduled playback time
+        isPlaying: false,
+        scheduledSources: [] // Track scheduled sources for cleanup
     },
     cartesia: {
         ttfa: null,
@@ -122,7 +129,11 @@ const providerState = {
         isBuffering: false,
         isBuffered: false,
         firstChunkReceived: false,
-        audioChunks: [] // Accumulate raw audio chunks (PCM format)
+        audioChunks: [],
+        playbackQueue: [],
+        playHeadTime: null,
+        isPlaying: false,
+        scheduledSources: []
     },
     deepgram: {
         ttfa: null,
@@ -132,7 +143,11 @@ const providerState = {
         isBuffering: false,
         isBuffered: false,
         firstChunkReceived: false,
-        audioChunks: [] // Accumulate raw audio chunks (linear16 PCM)
+        audioChunks: [],
+        playbackQueue: [],
+        playHeadTime: null,
+        isPlaying: false,
+        scheduledSources: []
     },
     rime: {
         ttfa: null,
@@ -142,7 +157,11 @@ const providerState = {
         isBuffering: false,
         isBuffered: false,
         firstChunkReceived: false,
-        audioChunks: [] // Accumulate raw audio chunks (PCM format)
+        audioChunks: [],
+        playbackQueue: [],
+        playHeadTime: null,
+        isPlaying: false,
+        scheduledSources: []
     }
 };
 
@@ -210,6 +229,13 @@ function pcmToWavBlob(pcmBytes, { sampleRate = 24000, numChannels = 1, bytesPerS
 
 // Initialize WebSocket connection
 function initWebSocket() {
+    // Close existing connection if any
+    if (ws) {
+        ws.onclose = null; // Prevent reconnection loop
+        ws.close();
+        ws = null;
+    }
+    
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${protocol}//${window.location.host}`;
     
@@ -305,13 +331,12 @@ function initWebSocket() {
     ws.onclose = () => {
         console.log('WebSocket closed');
         updateStatus('all', 'Disconnected');
-        // Attempt to reconnect after 2 seconds
-        setTimeout(initWebSocket, 2000);
+        // Don't auto-reconnect - let user refresh page
     };
 }
 
 // Handle incoming audio chunk
-function handleAudioChunk(provider, base64Data) {
+async function handleAudioChunk(provider, base64Data) {
     const state = providerState[provider];
     
     if (!state) {
@@ -330,16 +355,155 @@ function handleAudioChunk(provider, base64Data) {
         updateStatus(provider, 'Buffering...');
     }
     
-    // Accumulate audio chunk (don't play it)
+    // Accumulate audio chunk for download (keep all chunks)
     try {
         const audioData = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0));
         state.audioChunks.push(audioData);
+        
+        // Convert chunk to AudioBuffer and add to playback queue for streaming
+        const chunkBuffer = await chunkToAudioBuffer(provider, audioData);
+        if (chunkBuffer) {
+            // Skip extremely short chunks for streaming playback (prevents clicks from tiny edge chunks)
+            // Use them for download accumulator but don't enqueue for streaming
+            const minChunkDuration = 0.02; // 20ms minimum
+            if (chunkBuffer.duration >= minChunkDuration) {
+                state.playbackQueue.push(chunkBuffer);
+                
+                // If playback is already active, schedule this chunk immediately
+                if (state.isPlaying && state.playHeadTime !== null) {
+                    scheduleChunkPlayback(provider, chunkBuffer);
+                }
+            }
+            // Note: chunk is still in audioChunks for download, just not in playbackQueue
+        } else {
+            console.warn(`[${provider.toUpperCase()}] chunkToAudioBuffer returned null for chunk of size ${audioData.length} bytes`);
+        }
+        
+        // Check for minimum playable threshold (~150ms of audio) to enable early playback
+        // Only check if not already buffered (play button not shown yet)
+        if (!state.isBuffered) {
+            // Calculate total duration from playback queue
+            const totalDuration = state.playbackQueue.reduce((sum, buf) => sum + buf.duration, 0);
+            const minDurationMs = 150; // Minimum playable audio duration
+            const totalDurationMs = totalDuration * 1000;
+            
+            // Debug logging
+            if (state.playbackQueue.length <= 3) {
+                console.log(`[${provider.toUpperCase()}] Checking threshold: ${totalDurationMs.toFixed(1)}ms / ${minDurationMs}ms (${state.playbackQueue.length} chunks, providerStartTimes exists: ${!!providerStartTimes[provider]})`);
+            }
+            
+            if (totalDurationMs >= minDurationMs) {
+                state.isBuffered = true;
+                
+                // Calculate TTFPA (Time to First Playable Audio) = time from request start to play button
+                // TTFPA = TTFA + (time from first chunk to play button)
+                if (startTime) {
+                    const ttfpa = Date.now() - startTime;
+                    providerBufferingTimes[provider] = ttfpa; // Store as TTFPA
+                }
+                
+                updateStatus(provider, 'Ready to Play');
+                checkAllBufferingComplete();
+            }
+        }
     } catch (error) {
         console.error(`Error processing audio chunk for ${provider}:`, error);
     }
 }
 
-// Build complete AudioBuffer from accumulated chunks
+// Schedule a single AudioBuffer chunk for playback
+function scheduleChunkPlayback(provider, audioBuffer) {
+    const state = providerState[provider];
+    const ctx = initAudioContext();
+    
+    if (!state.isPlaying || state.playHeadTime === null) {
+        return;
+    }
+    
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+    
+    const startTime = state.playHeadTime;
+    source.start(startTime);
+    
+    // Update playHeadTime for next chunk
+    state.playHeadTime = startTime + audioBuffer.duration;
+    
+    // Track source for cleanup
+    state.scheduledSources.push(source);
+    
+    source.onended = () => {
+        // Remove from scheduled sources when done
+        const index = state.scheduledSources.indexOf(source);
+        if (index > -1) {
+            state.scheduledSources.splice(index, 1);
+        }
+        
+        // If all sources are done and stream is complete, stop playback
+        if (state.scheduledSources.length === 0 && !state.isStreaming) {
+            state.isPlaying = false;
+            state.playHeadTime = null;
+            updateStatus(provider, 'Ready to Play');
+        }
+    };
+}
+
+// Convert a single chunk (Uint8Array) to AudioBuffer for streaming playback
+async function chunkToAudioBuffer(provider, chunkData) {
+    const ctx = initAudioContext();
+    
+    // Get provider-specific audio format
+    let sampleRate = 24000;
+    let bytesPerSample = 2;
+    if (provider === 'elevenlabs') {
+        sampleRate = 22050;
+        bytesPerSample = 2;
+    } else if (provider === 'cartesia') {
+        sampleRate = 24000;
+        bytesPerSample = 4; // float32
+    } else if (provider === 'deepgram') {
+        sampleRate = 24000;
+        bytesPerSample = 2;
+    } else if (provider === 'rime') {
+        sampleRate = 24000;
+        bytesPerSample = 2;
+    }
+    
+    try {
+        if (provider === 'cartesia') {
+            // Cartesia: float32 PCM
+            const frameCount = Math.floor(chunkData.length / bytesPerSample);
+            if (frameCount === 0) return null;
+            
+            const audioBuffer = ctx.createBuffer(1, frameCount, sampleRate);
+            const channelData = audioBuffer.getChannelData(0);
+            const float32View = new Float32Array(chunkData.buffer, chunkData.byteOffset, Math.floor(chunkData.length / 4));
+            for (let i = 0; i < Math.min(float32View.length, frameCount); i++) {
+                channelData[i] = float32View[i];
+            }
+            return audioBuffer;
+        } else {
+            // ElevenLabs, Deepgram, Rime: 16-bit signed integer PCM
+            const frameCount = Math.floor(chunkData.length / bytesPerSample);
+            if (frameCount === 0) return null;
+            
+            const audioBuffer = ctx.createBuffer(1, frameCount, sampleRate);
+            const channelData = audioBuffer.getChannelData(0);
+            const dv = new DataView(chunkData.buffer, chunkData.byteOffset, chunkData.byteLength);
+            for (let i = 0; i < frameCount; i++) {
+                const int16Sample = dv.getInt16(i * bytesPerSample, true);
+                channelData[i] = int16Sample / 32768.0;
+            }
+            return audioBuffer;
+        }
+    } catch (error) {
+        console.error(`Error converting chunk to AudioBuffer for ${provider}:`, error);
+        return null;
+    }
+}
+
+// Build complete AudioBuffer from accumulated chunks (for download)
 async function buildAudioBuffer(provider) {
     const state = providerState[provider];
     const ctx = initAudioContext();
@@ -366,15 +530,25 @@ async function buildAudioBuffer(provider) {
         let audioBuffer;
         
         if (provider === 'elevenlabs') {
-            // ElevenLabs sends MP3 - decode with decodeAudioData
-            console.log(`Decoding ${provider} audio as MP3, total size: ${combinedAudio.length} bytes`);
-            try {
-                audioBuffer = await ctx.decodeAudioData(combinedAudio.buffer);
-                console.log(`${provider} audio decoded successfully, duration: ${audioBuffer.duration}s`);
-            } catch (decodeError) {
-                console.error(`Error decoding ${provider} audio:`, decodeError);
-                throw decodeError; // Will be caught by outer catch
+            // ElevenLabs sends raw PCM (16-bit signed integer) at 22050 Hz - convert to AudioBuffer
+            const sampleRate = 22050;
+            const numChannels = 1; // Mono
+            const bytesPerSample = 2; // 16-bit = 2 bytes per sample
+            const frameCount = Math.floor(combinedAudio.length / bytesPerSample);
+            
+            console.log(`[elevenlabs] Processing PCM: ${combinedAudio.length} bytes, ${frameCount} frames at ${sampleRate}Hz`);
+            
+            audioBuffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+            const channelData = audioBuffer.getChannelData(0);
+            
+            // Convert 16-bit signed integer PCM to float32
+            const dv = new DataView(combinedAudio.buffer, combinedAudio.byteOffset, combinedAudio.byteLength);
+            for (let i = 0; i < frameCount; i++) {
+                const int16Sample = dv.getInt16(i * bytesPerSample, true);
+                channelData[i] = int16Sample / 32768.0;
             }
+            
+            console.log(`[elevenlabs] Built AudioBuffer with ${frameCount} frames, duration: ${audioBuffer.duration.toFixed(3)}s`);
         } else if (provider === 'rime') {
             // Rime sends raw PCM (16-bit signed integer) - convert to AudioBuffer
             const sampleRate = 24000;
@@ -397,128 +571,36 @@ async function buildAudioBuffer(provider) {
             console.log(`[rime] Built AudioBuffer with ${frameCount} frames, duration: ${audioBuffer.duration}s`);
         } else if (provider === 'deepgram') {
             // Deepgram sends linear16 (16-bit signed integer PCM)
-            // Wrap with WAV header to avoid clicks/pops at boundaries
-            const sampleRate = 24000;
+            // Simplified processing for faster buffering (similar to ElevenLabs/Rime)
+            const sampleRate = 24000; // Aura-2 uses 24000 Hz
             const numChannels = 1; // Mono
             const bytesPerSample = 2; // 16-bit = 2 bytes per sample
             const frameCount = Math.floor(combinedAudio.length / bytesPerSample);
             
             console.log(`[deepgram] Processing linear16 PCM: ${combinedAudio.length} bytes, ${frameCount} frames at ${sampleRate}Hz`);
             
-            // First, convert to AudioBuffer to apply DC offset correction and smooth boundaries
-            const tempBuffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
-            const channelData = tempBuffer.getChannelData(0);
+            audioBuffer = ctx.createBuffer(numChannels, frameCount, sampleRate);
+            const channelData = audioBuffer.getChannelData(0);
             
-            // Convert 16-bit signed integer PCM to float32
+            // Convert 16-bit signed integer PCM to float32 (single pass, no post-processing)
             const dv = new DataView(combinedAudio.buffer, combinedAudio.byteOffset, combinedAudio.byteLength);
             for (let i = 0; i < frameCount; i++) {
                 const int16Sample = dv.getInt16(i * bytesPerSample, true);
                 channelData[i] = int16Sample / 32768.0;
             }
             
-            // Calculate and remove DC offset (mean value)
-            let sum = 0;
-            for (let i = 0; i < frameCount; i++) {
-                sum += channelData[i];
-            }
-            const dcOffset = sum / frameCount;
-            console.log(`[deepgram] DC offset detected: ${dcOffset.toFixed(6)}`);
-            
-            // Remove DC offset
-            if (Math.abs(dcOffset) > 0.0001) {
-                for (let i = 0; i < frameCount; i++) {
-                    channelData[i] -= dcOffset;
-                }
-                console.log(`[deepgram] DC offset removed`);
-            }
-            
-            // Apply longer, smoother fade-in/fade-out to prevent clicks at boundaries
-            // Use a longer fade (up to 480 samples = 20ms at 24kHz) for very smooth transitions
-            const fadeSamples = Math.min(480, Math.floor(frameCount * 0.03)); // 3% of audio or 480 samples (20ms), whichever is smaller
+            // Minimal fade-in/fade-out to prevent clicks (very short, simple linear fade)
+            const fadeSamples = Math.min(120, Math.floor(frameCount * 0.01)); // 120 samples = 5ms at 24kHz
             if (fadeSamples > 0 && frameCount > fadeSamples * 2) {
-                // Fade in using smoother curve (raised cosine / Hann window)
+                // Simple linear fade (much faster than cosine/Hann)
                 for (let i = 0; i < fadeSamples; i++) {
-                    // Hann window: smoother than cosine, eliminates clicks better
-                    const fade = 0.5 * (1 - Math.cos(2 * Math.PI * i / (fadeSamples - 1)));
-                    channelData[i] *= fade;
+                    channelData[i] *= i / fadeSamples;
                 }
-                // Fade out using Hann window
-                for (let i = frameCount - fadeSamples; i < frameCount; i++) {
-                    const fade = 0.5 * (1 - Math.cos(2 * Math.PI * (frameCount - 1 - i) / (fadeSamples - 1)));
-                    channelData[i] *= fade;
-                }
-                console.log(`[deepgram] Applied ${fadeSamples}-sample Hann window fade in/out`);
-            }
-            
-            // Find zero crossings near boundaries and trim to them for smooth start/end
-            if (frameCount > 20) {
-                // Find first zero crossing near start (look further ahead)
-                let startIdx = 0;
-                const searchRange = Math.min(500, Math.floor(frameCount * 0.1)); // Search up to 10% of audio
-                for (let i = 1; i < searchRange; i++) {
-                    // Check for zero crossing (sign change)
-                    if ((channelData[i - 1] <= 0 && channelData[i] >= 0) || 
-                        (channelData[i - 1] >= 0 && channelData[i] <= 0)) {
-                        // Found zero crossing - use this as start point
-                        startIdx = i;
-                        break;
-                    }
-                }
-                // Apply smooth fade to samples before the first zero crossing
-                if (startIdx > 0) {
-                    const preFadeSamples = Math.min(startIdx, 50);
-                    for (let i = 0; i < startIdx; i++) {
-                        if (i < preFadeSamples) {
-                            // Smooth fade to zero
-                            const fade = i / preFadeSamples;
-                            channelData[i] *= fade;
-                        } else {
-                            channelData[i] = 0;
-                        }
-                    }
-                }
-                
-                // Find last zero crossing near end (look further back)
-                let endIdx = frameCount - 1;
-                for (let i = frameCount - 2; i >= Math.max(0, frameCount - searchRange); i--) {
-                    // Check for zero crossing (sign change)
-                    if ((channelData[i] <= 0 && channelData[i + 1] >= 0) || 
-                        (channelData[i] >= 0 && channelData[i + 1] <= 0)) {
-                        // Found zero crossing - use this as end point
-                        endIdx = i + 1;
-                        break;
-                    }
-                }
-                // Apply smooth fade to samples after the last zero crossing
-                if (endIdx < frameCount - 1) {
-                    const postFadeSamples = Math.min(frameCount - endIdx, 50);
-                    for (let i = endIdx; i < frameCount; i++) {
-                        const offset = i - endIdx;
-                        if (offset < postFadeSamples) {
-                            // Smooth fade to zero
-                            const fade = 1 - (offset / postFadeSamples);
-                            channelData[i] *= fade;
-                        } else {
-                            channelData[i] = 0;
-                        }
-                    }
-                }
-                
-                if (startIdx > 0 || endIdx < frameCount - 1) {
-                    console.log(`[deepgram] Trimmed to zero crossings: start=${startIdx}, end=${endIdx}`);
+                for (let i = 0; i < fadeSamples; i++) {
+                    channelData[frameCount - fadeSamples + i] *= 1 - (i / fadeSamples);
                 }
             }
             
-            // Ensure first and last few samples are exactly zero for clean boundaries
-            const boundarySamples = 5;
-            for (let i = 0; i < boundarySamples && i < frameCount; i++) {
-                channelData[i] = 0;
-            }
-            for (let i = frameCount - boundarySamples; i < frameCount; i++) {
-                if (i >= 0) channelData[i] = 0;
-            }
-            
-            audioBuffer = tempBuffer;
             console.log(`[deepgram] Built AudioBuffer with ${frameCount} frames, duration: ${audioBuffer.duration.toFixed(3)}s`);
         } else {
             // Fallback: Assume PCM format
@@ -582,201 +664,196 @@ async function buildAudioBuffer(provider) {
     }
 }
 
-// Play buffered audio on demand
+// Play buffered audio on demand - uses streaming queue for gapless playback
 function playBufferedAudio(provider) {
     const state = providerState[provider];
-    
-    console.log(`Attempting to play ${provider} audio`);
-    
     const ctx = initAudioContext();
     
-    console.log(`Audio buffer exists:`, !!state.audioBuffer);
-    console.log(`Audio buffer duration:`, state.audioBuffer ? `${state.audioBuffer.duration}s` : 'N/A');
-    console.log(`Audio buffer sample rate:`, state.audioBuffer ? `${state.audioBuffer.sampleRate}Hz` : 'N/A');
-    
-    if (!state.audioBuffer) {
-        console.error(`No audio buffer available for ${provider}`);
+    if (!state.isBuffered || state.playbackQueue.length === 0) {
+        console.error(`No playable audio available for ${provider}`);
         updateStatus(provider, 'No Audio Available');
         return;
     }
     
     // Stop any currently playing audio for this provider
-    if (state.sourceNode) {
-        try {
-            state.sourceNode.stop();
-        } catch (e) {
-            // ignore
-        }
-        state.sourceNode = null;
+    if (state.isPlaying) {
+        stopPlayback(provider);
     }
     
-    try {
-        const source = ctx.createBufferSource();
-        source.buffer = state.audioBuffer;
-        source.connect(ctx.destination);
-        source.start(0);
-        
-        console.log(`${provider} audio playback started`);
-        state.sourceNode = source;
-        
-        updateStatus(provider, 'Playing...');
-        
-        source.onended = () => {
-            console.log(`${provider} audio playback ended`);
-            state.sourceNode = null;
-            updateStatus(provider, 'Ready to Play');
-        };
-        
-        source.onerror = (error) => {
-            console.error(`${provider} audio playback error:`, error);
-            updateStatus(provider, 'Playback Error');
-        };
-    } catch (playError) {
-        console.error(`Error playing ${provider} audio:`, playError);
-        updateStatus(provider, `Play Error: ${playError.message}`);
-    }
+    // Initialize playback queue
+    state.isPlaying = true;
+    state.playHeadTime = ctx.currentTime + 0.1; // Start slightly in the future for scheduling
+    
+    // Schedule all queued chunks for playback
+    state.playbackQueue.forEach(chunkBuffer => {
+        scheduleChunkPlayback(provider, chunkBuffer);
+    });
+    
+    updateStatus(provider, 'Playing...');
+}
+
+// Stop playback for a provider
+function stopPlayback(provider) {
+    const state = providerState[provider];
+    
+    // Stop all scheduled sources
+    state.scheduledSources.forEach(source => {
+        try {
+            source.stop();
+        } catch (e) {
+            // Ignore errors (source may have already ended)
+        }
+    });
+    state.scheduledSources = [];
+    
+    state.isPlaying = false;
+    state.playHeadTime = null;
+    updateStatus(provider, 'Ready to Play');
 }
 
 
-// Handle stream completion
+// Handle stream completion - rebuilds full buffer for download, enables download button
 async function handleStreamComplete(provider) {
     const state = providerState[provider];
     state.isStreaming = false;
     state.isBuffering = false;
     
     console.log(`${provider} stream complete. Total chunks: ${state.audioChunks.length}`);
+    
+    // Fallback: Calculate TTFPA if it wasn't calculated during chunk processing
+    // This happens if the threshold was met but startTime wasn't available
+    if (!providerBufferingTimes[provider] && state.isBuffered && startTime) {
+        const ttfpa = Date.now() - startTime;
+        providerBufferingTimes[provider] = ttfpa;
+    }
     if (state.audioChunks.length > 0) {
         const totalSize = state.audioChunks.reduce((sum, chunk) => sum + chunk.length, 0);
         console.log(`${provider} total audio size: ${totalSize} bytes`);
     }
     
-    // Special handling for Cartesia and Rime raw PCM streams
-    // Cartesia uses PCM float32, Rime uses PCM int16 (handled in buildAudioBuffer)
-    if (provider === 'cartesia') {
+    // Rebuild complete audio buffer from all chunks for download
+    // This ensures the download button gets the full, complete audio file
+    if (state.audioChunks.length > 0) {
         try {
-            console.log(`Processing ${provider} raw PCM stream completion...`);
-            console.log(`${provider} audio chunks: ${state.audioChunks.length}`);
-            
-            if (!state.audioChunks.length) {
-                console.error(`${provider}: No audio chunks to process`);
-                updateStatus(provider, 'No Audio Data');
-                checkAllBufferingComplete();
-                return;
-            }
-            
-            // Concatenate all raw PCM bytes, ensuring 4-byte alignment
-            // Since chunks may not be aligned, we need to track byte position carefully
-            let totalLength = 0;
-            state.audioChunks.forEach(chunk => totalLength += chunk.length);
-            
-            console.log(`[${provider}] Total PCM byte length before alignment: ${totalLength}`);
-            console.log(`[${provider}] Number of chunks: ${state.audioChunks.length}`);
-            
-            // Check if length is a multiple of 4 (required for float32)
-            const remainder = totalLength % 4;
-            const alignedLength = totalLength - remainder;
-            
-            if (remainder !== 0) {
-                console.warn(`[${provider}] WARNING: PCM data length ${totalLength} is not a multiple of 4. Truncating ${remainder} bytes to ${alignedLength}.`);
-            }
-            
-            // Create a new ArrayBuffer with exact aligned size
-            const pcmBuffer = new ArrayBuffer(alignedLength);
-            const pcmBytes = new Uint8Array(pcmBuffer);
-            let offset = 0;
-            let bytesCopied = 0;
-            
-            // Copy chunks, ensuring we don't exceed aligned length
-            for (const chunk of state.audioChunks) {
-                const remainingBytes = alignedLength - bytesCopied;
-                if (remainingBytes <= 0) break;
+            // Special handling for Cartesia raw PCM streams
+            if (provider === 'cartesia') {
+                console.log(`Processing ${provider} raw PCM stream completion for download...`);
                 
-                const bytesToCopy = Math.min(chunk.length, remainingBytes);
-                pcmBytes.set(chunk.slice(0, bytesToCopy), offset);
-                offset += bytesToCopy;
-                bytesCopied += bytesToCopy;
-            }
-            
-            console.log(`[${provider}] Copied ${bytesCopied} bytes (aligned to ${alignedLength})`);
-            
-            // Interpret as float32 samples (little-endian)
-            const sampleRate = 24000;
-            const bytesPerSample = 4;
-            const frameCount = alignedLength / bytesPerSample;
-            
-            console.log(`[${provider}] Creating AudioBuffer: ${frameCount} frames at ${sampleRate}Hz`);
-            
-            const audioContext = initAudioContext();
-            const audioBuffer = audioContext.createBuffer(1, frameCount, sampleRate);
-            const channelData = audioBuffer.getChannelData(0);
-            
-            // Use Float32Array view of the buffer
-            const float32View = new Float32Array(pcmBuffer);
-            
-            // Copy samples from Float32Array to AudioBuffer
-            const samplesToCopy = Math.min(float32View.length, frameCount);
-            for (let i = 0; i < samplesToCopy; i++) {
-                channelData[i] = float32View[i];
-            }
-            
-            // If there are remaining frames, fill with silence
-            if (samplesToCopy < frameCount) {
-                for (let i = samplesToCopy; i < frameCount; i++) {
-                    channelData[i] = 0;
+                // Concatenate all raw PCM bytes, ensuring 4-byte alignment
+                let totalLength = 0;
+                state.audioChunks.forEach(chunk => totalLength += chunk.length);
+                
+                const remainder = totalLength % 4;
+                const alignedLength = totalLength - remainder;
+                
+                if (remainder !== 0) {
+                    console.warn(`[${provider}] WARNING: PCM data length ${totalLength} is not a multiple of 4. Truncating ${remainder} bytes to ${alignedLength}.`);
+                }
+                
+                // Create a new ArrayBuffer with exact aligned size
+                const pcmBuffer = new ArrayBuffer(alignedLength);
+                const pcmBytes = new Uint8Array(pcmBuffer);
+                let offset = 0;
+                let bytesCopied = 0;
+                
+                // Copy chunks, ensuring we don't exceed aligned length
+                for (const chunk of state.audioChunks) {
+                    const remainingBytes = alignedLength - bytesCopied;
+                    if (remainingBytes <= 0) break;
+                    
+                    const bytesToCopy = Math.min(chunk.length, remainingBytes);
+                    pcmBytes.set(chunk.slice(0, bytesToCopy), offset);
+                    offset += bytesToCopy;
+                    bytesCopied += bytesToCopy;
+                }
+                
+                // Interpret as float32 samples (little-endian)
+                const sampleRate = 24000;
+                const bytesPerSample = 4;
+                const frameCount = alignedLength / bytesPerSample;
+                
+                const audioContext = initAudioContext();
+                const audioBuffer = audioContext.createBuffer(1, frameCount, sampleRate);
+                const channelData = audioBuffer.getChannelData(0);
+                
+                // Use Float32Array view of the buffer
+                const float32View = new Float32Array(pcmBuffer);
+                
+                // Copy samples from Float32Array to AudioBuffer
+                const samplesToCopy = Math.min(float32View.length, frameCount);
+                for (let i = 0; i < samplesToCopy; i++) {
+                    channelData[i] = float32View[i];
+                }
+                
+                // If there are remaining frames, fill with silence
+                if (samplesToCopy < frameCount) {
+                    for (let i = samplesToCopy; i < frameCount; i++) {
+                        channelData[i] = 0;
+                    }
+                }
+                
+                state.audioBuffer = audioBuffer; // Update with complete buffer
+            } else {
+                // For other providers (ElevenLabs, Deepgram, Rime), rebuild from all chunks
+                const audioBuffer = await buildAudioBuffer(provider);
+                if (audioBuffer) {
+                    state.audioBuffer = audioBuffer; // Update with complete buffer
+                } else {
+                    console.error(`${provider} failed to build complete audio buffer for download`);
                 }
             }
             
-            console.log(`[${provider}] Built AudioBuffer with ${frameCount} frames, duration: ${audioBuffer.duration.toFixed(3)}s`);
-            
-            state.audioBuffer = audioBuffer;
-            state.isBuffered = true;
-            
-            updateStatus(provider, 'Ready to Play');
-            checkAllBufferingComplete();
-            return;
+            // Enable download button now that we have the complete audio
+            const downloadBtn = document.getElementById(`${provider}-download-btn`);
+            if (downloadBtn && state.audioBuffer) {
+                downloadBtn.style.display = 'block';
+            }
         } catch (err) {
-            console.error(`Error building ${provider} AudioBuffer from PCM:`, err);
-            updateStatus(provider, 'Buffer Error');
-            checkAllBufferingComplete();
-            return;
-        }
-        } else {
-        // For other providers (ElevenLabs, Deepgram, Rime), use the existing AudioBuffer approach
-        const audioBuffer = await buildAudioBuffer(provider);
-        
-        if (audioBuffer) {
-            state.audioBuffer = audioBuffer;
-            state.isBuffered = true;
-            updateStatus(provider, 'Ready to Play');
-            console.log(`${provider} audio buffer created successfully`);
-            
-            // Check if all providers are done buffering
-            checkAllBufferingComplete();
-        } else {
-            console.error(`${provider} failed to build audio buffer`);
-            updateStatus(provider, 'Buffer Error');
-            // Still check completion so play buttons can show for the other provider
-            checkAllBufferingComplete();
+            console.error(`Error building complete audio buffer for ${provider} download:`, err);
         }
     }
+    
+    // Check if all streams are complete
+    checkAllBufferingComplete();
 }
 
 // Check if all providers have finished buffering
 function checkAllBufferingComplete() {
     // Get enabled providers based on toggle states
+    const elevenlabsEnabled = document.getElementById('toggle-elevenlabs')?.checked ?? true;
+    const deepgramEnabled = document.getElementById('toggle-deepgram')?.checked ?? true;
     const cartesiaEnabled = document.getElementById('toggle-cartesia')?.checked ?? false;
     const rimeEnabled = document.getElementById('toggle-rime')?.checked ?? false;
     
-    const allProviders = ['elevenlabs', 'deepgram']; // Always enabled
+    const allProviders = [];
+    if (elevenlabsEnabled) allProviders.push('elevenlabs');
+    if (deepgramEnabled) allProviders.push('deepgram');
     if (cartesiaEnabled) allProviders.push('cartesia');
     if (rimeEnabled) allProviders.push('rime');
     
-    // Check if all enabled providers are done (either buffered successfully or errored out)
+    // Check if all enabled providers are done (streams complete, not just buffered)
     const allComplete = allProviders.every(provider => {
         const state = providerState[provider];
-        // Provider is complete if: buffered successfully OR (not streaming AND not buffering)
-        return state.isBuffered || (!state.isStreaming && !state.isBuffering);
+        // Provider is complete only when stream is done (not streaming AND not buffering)
+        return !state.isStreaming && !state.isBuffering;
     });
+    
+    // Log summary of all provider metrics when all streams are complete (one time only)
+    if (allComplete && !summaryPrinted) {
+        console.log('\n========== TTFPA (Time to First Playable Audio) SUMMARY ==========');
+        allProviders.forEach(provider => {
+            const state = providerState[provider];
+            const ttfpa = providerBufferingTimes[provider] || 'N/A';
+            const ttfa = state.ttfa || 'N/A';
+            console.log(`${provider.toUpperCase().padEnd(12)}: TTFPA=${ttfpa}ms, TTFA=${ttfa}ms`);
+        });
+        console.log('==========================================\n');
+        
+        // Mark summary as printed and clear tracking for next test
+        summaryPrinted = true;
+        providerStartTimes = {};
+        providerBufferingTimes = {};
+    }
     
     console.log('Checking if all buffering complete:', {
         allComplete,
@@ -794,35 +871,25 @@ function checkAllBufferingComplete() {
         }
     });
     
-    if (allComplete) {
-        // Show play buttons only for providers that successfully buffered
-        allProviders.forEach(provider => {
-            const state = providerState[provider];
-            const playBtn = document.getElementById(`${provider}-play-btn`);
-            
-            // All providers now use audioBuffer
-            const hasAudio = state.isBuffered && state.audioBuffer;
-            
-            if (playBtn && hasAudio) {
-                console.log(`Showing play button for ${provider}`);
-                playBtn.style.display = 'block';
-            } else if (playBtn) {
-                console.log(`Not showing play button for ${provider}:`, {
-                    isBuffered: state.isBuffered,
-                    hasAudio: hasAudio
-                });
-            }
-            
-            // Show/hide download button
-            const downloadBtn = document.getElementById(`${provider}-download-btn`);
-            if (downloadBtn && hasAudio) {
-                console.log(`Showing download button for ${provider}`);
-                downloadBtn.style.display = 'block';
-            } else if (downloadBtn) {
-                downloadBtn.style.display = 'none';
-            }
-        });
-    }
+    // Show play buttons immediately when a provider is buffered (early playback)
+    // Don't wait for all streams to complete - show as soon as we have playable audio
+    allProviders.forEach(provider => {
+        const state = providerState[provider];
+        const playBtn = document.getElementById(`${provider}-play-btn`);
+        
+        // Show play button as soon as we have a playable buffer (150ms threshold met)
+        // Use playbackQueue instead of audioBuffer for early playback
+        const hasAudio = state.isBuffered && state.playbackQueue.length > 0;
+        
+        if (playBtn && hasAudio) {
+            playBtn.style.display = 'block';
+        } else if (playBtn) {
+            playBtn.style.display = 'none';
+        }
+        
+        // Download button is only shown in handleStreamComplete when full stream is complete
+        // Don't show/hide it here - it's controlled by stream completion to ensure full audio
+    });
 }
 
 // Handle stream error
@@ -879,8 +946,17 @@ function resetProviderState() {
         state.isStreaming = false;
         state.isBuffering = false;
         state.isBuffered = false;
-        state.audioChunks = [];
-        state.audioBuffer = null;
+        state.audioChunks = []; // Download accumulator
+        state.audioBuffer = null; // Complete buffer for download
+        state.playbackQueue = []; // Streaming playback queue
+        state.playHeadTime = null;
+        state.isPlaying = false;
+        state.scheduledSources = [];
+        
+        // Stop any playing audio
+        if (state.isPlaying) {
+            stopPlayback(provider);
+        }
         
         if (state.sourceNode) {
             try {
@@ -915,7 +991,7 @@ function resetProviderState() {
 }
 
 // Reset a single provider's state (used when voice changes)
-function resetSingleProviderState(provider) {
+function resetSingleProviderState(provider, settingChanged = 'Setting') {
     const state = providerState[provider];
     if (!state) return;
     
@@ -955,7 +1031,9 @@ function resetSingleProviderState(provider) {
         ttfaElement.style.color = '#667eea';
     }
     
-    updateStatus(provider, 'Voice changed - Click "Start TTS Test" to hear new voice');
+    // Update status with appropriate message based on what changed
+    const settingName = settingChanged || 'Setting';
+    updateStatus(provider, `${settingName} changed - Click "Start TTS Test" to hear new audio`);
 }
 
 // Start TTS test
@@ -973,26 +1051,62 @@ function startTTSTest(text) {
     currentText = text.trim();
     
     // Check which providers are enabled
+    const elevenlabsEnabled = document.getElementById('toggle-elevenlabs')?.checked ?? true;
+    const deepgramEnabled = document.getElementById('toggle-deepgram')?.checked ?? true;
     const cartesiaEnabled = document.getElementById('toggle-cartesia')?.checked ?? false;
     const rimeEnabled = document.getElementById('toggle-rime')?.checked ?? false;
     
-    // Collect voice IDs from selectors (only for enabled providers)
-    const elevenlabsVoice = document.getElementById('elevenlabs-voice')?.value || 'Smxkoz0xiOoHo5WcSskf';
-    const deepgramVoice = document.getElementById('deepgram-voice')?.value || 'aura-2-thalia-en';
+    // Collect voice IDs and model from selectors (only for enabled providers)
     
-    const voices = {
-        elevenlabs: elevenlabsVoice,
-        deepgram: deepgramVoice
-    };
+    const voices = {};
+    const models = {};
+    
+    if (elevenlabsEnabled) {
+        voices.elevenlabs = document.getElementById('elevenlabs-voice')?.value || 'EXAVITQu4vr4xnSDxMaL';
+        models.elevenlabs = document.getElementById('elevenlabs-model')?.value || 'eleven_flash_v2_5';
+    }
+    
+    if (deepgramEnabled) {
+        voices.deepgram = document.getElementById('deepgram-voice')?.value || 'aura-2-thalia-en';
+        models.deepgram = document.getElementById('deepgram-model')?.value || 'aura-2';
+    }
+    
+    // Collect text normalization setting if multilingual v2 is selected (only for ElevenLabs if enabled)
+    const elevenlabsTextNorm = (elevenlabsEnabled && models.elevenlabs === 'eleven_multilingual_v2') 
+        ? (document.getElementById('elevenlabs-text-norm')?.value || 'auto')
+        : null;
     
     // Only include optional providers if enabled
     if (cartesiaEnabled) {
         voices.cartesia = document.getElementById('cartesia-voice')?.value || 'f786b574-daa5-4673-aa0c-cbe3e8534c02';
+        models.cartesia = document.getElementById('cartesia-model')?.value || 'sonic-turbo';
     }
     
     if (rimeEnabled) {
         voices.rime = document.getElementById('rime-voice')?.value || 'astra';
+        models.rime = document.getElementById('rime-model')?.value || 'mistv2';
     }
+    
+    // Collect text normalization setting for Rime (only for Mist v2)
+    const rimeModel = rimeEnabled 
+        ? (document.getElementById('rime-model')?.value || 'mistv2')
+        : null;
+    const rimeTextNorm = (rimeEnabled && rimeModel === 'mistv2')
+        ? (document.getElementById('rime-text-normalization')?.value || 'off')
+        : null;
+    
+    const textNormalization = {
+        elevenlabs: elevenlabsTextNorm,
+        rime: rimeTextNorm
+    };
+    
+    // Create enabledProviders object
+    const enabledProviders = {
+        elevenlabs: elevenlabsEnabled,
+        deepgram: deepgramEnabled,
+        cartesia: cartesiaEnabled,
+        rime: rimeEnabled
+    };
     
     // Reset state (only for enabled providers)
     resetProviderState();
@@ -1000,20 +1114,65 @@ function startTTSTest(text) {
     // Record start time for TTFA measurement
     startTime = Date.now();
     
-    // Send start message to server with voice IDs and enabled providers
-    ws.send(JSON.stringify({
+    // Reset provider timing tracking for new test
+    providerStartTimes = {};
+    providerBufferingTimes = {};
+    summaryPrinted = false; // Reset summary flag for new test
+    
+    console.log(`\n========== STARTING TTS TEST ==========`);
+    console.log(`Text: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
+    console.log(`Start Time: ${new Date().toISOString()}`);
+    console.log(`Enabled Providers: ${Object.keys(enabledProviders).filter(p => enabledProviders[p]).join(', ')}`);
+    console.log('==========================================\n');
+    
+    // Send start message to server with voice IDs, models, text normalization, and enabled providers
+    const startMessage = {
         type: 'start',
         text: currentText,
         voices: voices,
-        enabledProviders: {
-            elevenlabs: true,
-            deepgram: true,
-            cartesia: cartesiaEnabled,
-            rime: rimeEnabled
-        }
-    }));
+        models: models,
+        textNormalization: textNormalization,
+        enabledProviders: enabledProviders
+    };
     
-    updateStatus('all', 'Starting...');
+    // Check WebSocket state before sending
+    if (!ws) {
+        initWebSocket();
+        // Wait for connection
+        const waitForConnection = (retries = 10) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(startMessage));
+                updateStatus('all', 'Starting...');
+            } else if (retries > 0) {
+                setTimeout(() => waitForConnection(retries - 1), 200);
+            } else {
+                updateStatus('all', 'Connection Failed');
+            }
+        };
+        waitForConnection();
+    } else if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify(startMessage));
+        updateStatus('all', 'Starting...');
+    } else if (ws.readyState === WebSocket.CONNECTING) {
+        ws.addEventListener('open', () => {
+            ws.send(JSON.stringify(startMessage));
+            updateStatus('all', 'Starting...');
+        }, { once: true });
+    } else {
+        initWebSocket();
+        // Wait for connection
+        const waitForConnection = (retries = 10) => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(startMessage));
+                updateStatus('all', 'Starting...');
+            } else if (retries > 0) {
+                setTimeout(() => waitForConnection(retries - 1), 200);
+            } else {
+                updateStatus('all', 'Connection Failed');
+            }
+        };
+        waitForConnection();
+    }
     
     // Disable start button
     const startBtn = document.getElementById('start-test-btn');
@@ -1064,17 +1223,29 @@ document.addEventListener('DOMContentLoaded', () => {
     populateChallengeDropdown();
     
     // Provider toggle handlers
+    const toggleElevenLabs = document.getElementById('toggle-elevenlabs');
+    const toggleDeepgram = document.getElementById('toggle-deepgram');
     const toggleCartesia = document.getElementById('toggle-cartesia');
     const toggleRime = document.getElementById('toggle-rime');
+    const elevenlabsColumn = document.getElementById('elevenlabs-column');
+    const deepgramColumn = document.getElementById('deepgram-column');
     const cartesiaColumn = document.getElementById('cartesia-column');
     const rimeColumn = document.getElementById('rime-column');
     const providersSection = document.querySelector('.providers-section');
     
     function updateProviderLayout() {
+        const elevenlabsVisible = toggleElevenLabs?.checked ?? true;
+        const deepgramVisible = toggleDeepgram?.checked ?? true;
         const cartesiaVisible = toggleCartesia?.checked ?? false;
         const rimeVisible = toggleRime?.checked ?? false;
         
         // Show/hide columns
+        if (elevenlabsColumn) {
+            elevenlabsColumn.classList.toggle('hidden', !elevenlabsVisible);
+        }
+        if (deepgramColumn) {
+            deepgramColumn.classList.toggle('hidden', !deepgramVisible);
+        }
         if (cartesiaColumn) {
             cartesiaColumn.classList.toggle('hidden', !cartesiaVisible);
         }
@@ -1083,8 +1254,8 @@ document.addEventListener('DOMContentLoaded', () => {
         }
         
         // Update grid columns based on visible providers
-        // Always have ElevenLabs and Deepgram (2), plus optional Cartesia and Rime
-        const visibleCount = 2 + (cartesiaVisible ? 1 : 0) + (rimeVisible ? 1 : 0);
+        const visibleCount = (elevenlabsVisible ? 1 : 0) + (deepgramVisible ? 1 : 0) + 
+                            (cartesiaVisible ? 1 : 0) + (rimeVisible ? 1 : 0);
         
         if (providersSection) {
             providersSection.style.gridTemplateColumns = `repeat(${visibleCount}, 1fr)`;
@@ -1095,12 +1266,29 @@ document.addEventListener('DOMContentLoaded', () => {
     updateProviderLayout();
     
     // Add event listeners for toggles
+    if (toggleElevenLabs) {
+        toggleElevenLabs.addEventListener('change', () => {
+            updateProviderLayout();
+            if (!toggleElevenLabs.checked) {
+                resetSingleProviderState('elevenlabs', 'Setting');
+            }
+        });
+    }
+    
+    if (toggleDeepgram) {
+        toggleDeepgram.addEventListener('change', () => {
+            updateProviderLayout();
+            if (!toggleDeepgram.checked) {
+                resetSingleProviderState('deepgram', 'Setting');
+            }
+        });
+    }
+    
     if (toggleCartesia) {
         toggleCartesia.addEventListener('change', () => {
             updateProviderLayout();
-            // Reset Cartesia state when hidden
             if (!toggleCartesia.checked) {
-                resetSingleProviderState('cartesia');
+                resetSingleProviderState('cartesia', 'Setting');
             }
         });
     }
@@ -1108,9 +1296,8 @@ document.addEventListener('DOMContentLoaded', () => {
     if (toggleRime) {
         toggleRime.addEventListener('change', () => {
             updateProviderLayout();
-            // Reset Rime state when hidden
             if (!toggleRime.checked) {
-                resetSingleProviderState('rime');
+                resetSingleProviderState('rime', 'Setting');
             }
         });
     }
@@ -1362,28 +1549,98 @@ document.addEventListener('DOMContentLoaded', () => {
     const elevenlabsVoiceSelect = document.getElementById('elevenlabs-voice');
     if (elevenlabsVoiceSelect) {
         elevenlabsVoiceSelect.addEventListener('change', () => {
-            resetSingleProviderState('elevenlabs');
+            resetSingleProviderState('elevenlabs', 'Voice');
+        });
+    }
+    
+    const elevenlabsModelSelect = document.getElementById('elevenlabs-model');
+    const elevenlabsTextNormToggle = document.getElementById('elevenlabs-text-normalization');
+    
+    // Function to update toggle visibility
+    const updateTextNormToggle = () => {
+        if (elevenlabsTextNormToggle && elevenlabsModelSelect) {
+            if (elevenlabsModelSelect.value === 'eleven_multilingual_v2') {
+                elevenlabsTextNormToggle.style.display = 'block';
+            } else {
+                elevenlabsTextNormToggle.style.display = 'none';
+            }
+        }
+    };
+    
+    if (elevenlabsModelSelect) {
+        // Initialize toggle visibility on page load
+        updateTextNormToggle();
+        
+        elevenlabsModelSelect.addEventListener('change', () => {
+            resetSingleProviderState('elevenlabs', 'Model');
+            updateTextNormToggle();
+        });
+    }
+    
+    const elevenlabsTextNormSelect = document.getElementById('elevenlabs-text-norm');
+    if (elevenlabsTextNormSelect) {
+        elevenlabsTextNormSelect.addEventListener('change', () => {
+            resetSingleProviderState('elevenlabs', 'Text normalization');
+        });
+    }
+    
+    const cartesiaModelSelect = document.getElementById('cartesia-model');
+    if (cartesiaModelSelect) {
+        cartesiaModelSelect.addEventListener('change', () => {
+            resetSingleProviderState('cartesia', 'Model');
         });
     }
     
     const cartesiaVoiceSelect = document.getElementById('cartesia-voice');
     if (cartesiaVoiceSelect) {
         cartesiaVoiceSelect.addEventListener('change', () => {
-            resetSingleProviderState('cartesia');
+            resetSingleProviderState('cartesia', 'Voice');
         });
     }
     
     const deepgramVoiceSelect = document.getElementById('deepgram-voice');
     if (deepgramVoiceSelect) {
         deepgramVoiceSelect.addEventListener('change', () => {
-            resetSingleProviderState('deepgram');
+            resetSingleProviderState('deepgram', 'Voice');
+        });
+    }
+    
+    const rimeModelSelect = document.getElementById('rime-model');
+    const rimeTextNormToggle = document.getElementById('rime-text-normalization-toggle');
+    
+    // Function to update text normalization toggle visibility
+    const updateRimeTextNormToggle = () => {
+        if (rimeTextNormToggle && rimeModelSelect) {
+            const selectedModel = rimeModelSelect.value;
+            if (selectedModel === 'mistv2') {
+                rimeTextNormToggle.style.display = 'block';
+            } else {
+                rimeTextNormToggle.style.display = 'none';
+            }
+        }
+    };
+    
+    if (rimeModelSelect) {
+        // Initialize toggle visibility on page load
+        updateRimeTextNormToggle();
+        
+        rimeModelSelect.addEventListener('change', () => {
+            resetSingleProviderState('rime', 'Model');
+            updateRimeTextNormToggle();
         });
     }
     
     const rimeVoiceSelect = document.getElementById('rime-voice');
     if (rimeVoiceSelect) {
         rimeVoiceSelect.addEventListener('change', () => {
-            resetSingleProviderState('rime');
+            resetSingleProviderState('rime', 'Voice');
+        });
+    }
+    
+    const rimeTextNormSelect = document.getElementById('rime-text-normalization');
+    if (rimeTextNormSelect) {
+        rimeTextNormSelect.addEventListener('change', () => {
+            resetSingleProviderState('rime', 'Text normalization');
         });
     }
 });

@@ -10,7 +10,7 @@
     <div class="container">
         <header>
             <h1>Streaming TTS Alphanumeric Comparison</h1>
-            <p class="subtitle">Compare ElevenLabs Flash v2.5 and Deepgram Aura-2 (always on), with optional Cartesia Sonic-3 and Rime Mist v2</p>
+            <p class="subtitle">Compare TTS providers: ElevenLabs, Deepgram, Cartesia, and Rime</p>
         </header>
 
         <!-- Instructions Section -->
@@ -71,15 +71,23 @@
         <!-- Provider Toggle Section -->
         <section class="provider-toggle-section">
             <div class="toggle-group">
-                <label class="toggle-label">Optional Providers:</label>
+                <label class="toggle-label">Select Providers:</label>
                 <div class="toggle-options">
                     <label class="toggle-option">
+                        <input type="checkbox" id="toggle-elevenlabs" checked>
+                        <span>ElevenLabs</span>
+                    </label>
+                    <label class="toggle-option">
+                        <input type="checkbox" id="toggle-deepgram" checked>
+                        <span>Deepgram</span>
+                    </label>
+                    <label class="toggle-option">
                         <input type="checkbox" id="toggle-cartesia">
-                        <span>Cartesia Sonic-3</span>
+                        <span>Cartesia</span>
                     </label>
                     <label class="toggle-option">
                         <input type="checkbox" id="toggle-rime">
-                        <span>Rime Mist v2</span>
+                        <span>Rime</span>
                     </label>
                 </div>
             </div>
@@ -90,16 +98,32 @@
             <!-- ElevenLabs Column -->
             <div class="provider-column" id="elevenlabs-column">
                 <div class="provider-header">
-                    <h2>ElevenLabs Flash v2.5</h2>
+                    <h2>ElevenLabs</h2>
+                </div>
+                <div class="voice-selector">
+                    <label for="elevenlabs-model">Model:</label>
+                    <select id="elevenlabs-model" class="voice-select">
+                        <option value="eleven_flash_v2_5" selected>Flash v2.5 (default)</option>
+                        <option value="eleven_turbo_v2_5">Turbo v2.5</option>
+                        <option value="eleven_multilingual_v2">Multilingual v2</option>
+                    </select>
                 </div>
                 <div class="voice-selector">
                     <label for="elevenlabs-voice">Voice:</label>
                     <select id="elevenlabs-voice" class="voice-select">
-                        <option value="Smxkoz0xiOoHo5WcSskf">Dexter</option>
-                        <option value="f5HLTX707KIM4SzJYzSz" selected>Brad (default)</option>
-                        <option value="XcXEQzuLXRU9RcfWzEJt">Veda Sky</option>
+                        <option value="EXAVITQu4vr4xnSDxMaL" selected>Sarah (default)</option>
                         <option value="CwhRBWXzGAHq8TQ4Fs17">Roger</option>
                         <option value="SAz9YHcvj6GT2YYXdXww">River</option>
+                        <option value="cgSgspJ2msm6clMCkdW9">Jessica</option>
+                        <option value="bIHbv24MWmeRgasZH58o">Will</option>
+                    </select>
+                </div>
+                <div class="voice-selector" id="elevenlabs-text-normalization" style="display: none;">
+                    <label for="elevenlabs-text-norm">Text Normalization:</label>
+                    <select id="elevenlabs-text-norm" class="voice-select">
+                        <option value="auto" selected>Auto (default)</option>
+                        <option value="on">On</option>
+                        <option value="off">Off</option>
                     </select>
                 </div>
                 <div class="metrics">
@@ -119,7 +143,14 @@
             <!-- Cartesia Column -->
             <div class="provider-column" id="cartesia-column">
                 <div class="provider-header">
-                    <h2>Cartesia Sonic-3</h2>
+                    <h2>Cartesia</h2>
+                </div>
+                <div class="voice-selector">
+                    <label for="cartesia-model">Model:</label>
+                    <select id="cartesia-model" class="voice-select">
+                        <option value="sonic-3">Sonic-3</option>
+                        <option value="sonic-turbo" selected>Sonic Turbo (default)</option>
+                    </select>
                 </div>
                 <div class="voice-selector">
                     <label for="cartesia-voice">Voice:</label>
@@ -148,7 +179,13 @@
             <!-- Deepgram Column -->
             <div class="provider-column" id="deepgram-column">
                 <div class="provider-header">
-                    <h2>Deepgram Aura-2</h2>
+                    <h2>Deepgram</h2>
+                </div>
+                <div class="voice-selector">
+                    <label for="deepgram-model">Model:</label>
+                    <select id="deepgram-model" class="voice-select" disabled>
+                        <option value="aura-2" selected>Aura-2</option>
+                    </select>
                 </div>
                 <div class="voice-selector">
                     <label for="deepgram-voice">Voice:</label>
@@ -177,7 +214,14 @@
             <!-- Rime Column -->
             <div class="provider-column" id="rime-column">
                 <div class="provider-header">
-                    <h2>Rime Mist v2</h2>
+                    <h2>Rime</h2>
+                </div>
+                <div class="voice-selector">
+                    <label for="rime-model">Model:</label>
+                    <select id="rime-model" class="voice-select">
+                        <option value="mistv2" selected>Mist v2 (default)</option>
+                        <option value="arcana">Arcana</option>
+                    </select>
                 </div>
                 <div class="voice-selector">
                     <label for="rime-voice">Voice:</label>
@@ -187,6 +231,13 @@
                         <option value="eucalyptus">Eucalyptus</option>
                         <option value="lagoon">Lagoon</option>
                         <option value="mari">Mari</option>
+                    </select>
+                </div>
+                <div class="voice-selector" id="rime-text-normalization-toggle">
+                    <label for="rime-text-normalization">Text Normalization:</label>
+                    <select id="rime-text-normalization" class="voice-select">
+                        <option value="off" selected>Off (default)</option>
+                        <option value="on">On</option>
                     </select>
                 </div>
                 <div class="metrics">
