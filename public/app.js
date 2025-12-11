@@ -445,6 +445,12 @@ function scheduleChunkPlayback(provider, audioBuffer) {
             state.isPlaying = false;
             state.playHeadTime = null;
             updateStatus(provider, 'Ready to Play');
+            
+            // Re-enable all play buttons when playback naturally ends
+            setAllPlayButtonsEnabled(true);
+            
+            // Reset button text to "Play"
+            updatePlayButtonText(provider, false);
         }
     };
 }
@@ -664,6 +670,38 @@ async function buildAudioBuffer(provider) {
     }
 }
 
+// Helper function to get provider display name
+function getProviderDisplayName(provider) {
+    const names = {
+        'elevenlabs': 'ElevenLabs',
+        'cartesia': 'Cartesia',
+        'deepgram': 'Deepgram',
+        'rime': 'Rime'
+    };
+    return names[provider] || provider;
+}
+
+// Helper function to enable/disable all play buttons
+function setAllPlayButtonsEnabled(enabled, exceptProvider = null) {
+    const providers = ['elevenlabs', 'cartesia', 'deepgram', 'rime'];
+    providers.forEach(p => {
+        if (p === exceptProvider) return;
+        const btn = document.getElementById(`${p}-play-btn`);
+        if (btn) {
+            btn.disabled = !enabled;
+        }
+    });
+}
+
+// Helper function to update play button text
+function updatePlayButtonText(provider, isPlaying) {
+    const btn = document.getElementById(`${provider}-play-btn`);
+    if (btn) {
+        const providerName = getProviderDisplayName(provider);
+        btn.textContent = isPlaying ? `Restart ${providerName}` : `Play ${providerName}`;
+    }
+}
+
 // Play buffered audio on demand - uses streaming queue for gapless playback
 function playBufferedAudio(provider) {
     const state = providerState[provider];
@@ -675,10 +713,26 @@ function playBufferedAudio(provider) {
         return;
     }
     
-    // Stop any currently playing audio for this provider
+    // Stop any currently playing audio for this provider (without re-enabling buttons)
     if (state.isPlaying) {
-        stopPlayback(provider);
+        // Stop all scheduled sources
+        state.scheduledSources.forEach(source => {
+            try {
+                source.stop();
+            } catch (e) {
+                // Ignore errors (source may have already ended)
+            }
+        });
+        state.scheduledSources = [];
+        state.isPlaying = false;
+        state.playHeadTime = null;
     }
+    
+    // Disable all other play buttons
+    setAllPlayButtonsEnabled(false, provider);
+    
+    // Update button text to "Restart"
+    updatePlayButtonText(provider, true);
     
     // Initialize playback queue
     state.isPlaying = true;
@@ -709,6 +763,12 @@ function stopPlayback(provider) {
     state.isPlaying = false;
     state.playHeadTime = null;
     updateStatus(provider, 'Ready to Play');
+    
+    // Re-enable all play buttons
+    setAllPlayButtonsEnabled(true);
+    
+    // Reset button text to "Play"
+    updatePlayButtonText(provider, false);
 }
 
 
@@ -883,6 +943,11 @@ function checkAllBufferingComplete() {
         
         if (playBtn && hasAudio) {
             playBtn.style.display = 'block';
+            playBtn.disabled = false; // Ensure button is enabled when shown
+            // Only reset text if not currently playing
+            if (!state.isPlaying) {
+                updatePlayButtonText(provider, false);
+            }
         } else if (playBtn) {
             playBtn.style.display = 'none';
         }
@@ -971,6 +1036,8 @@ function resetProviderState() {
         const playBtn = document.getElementById(`${provider}-play-btn`);
         if (playBtn) {
             playBtn.style.display = 'none';
+            playBtn.disabled = false; // Re-enable when hidden
+            updatePlayButtonText(provider, false); // Reset text
         }
         
         // Hide download button
